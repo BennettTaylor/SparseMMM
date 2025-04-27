@@ -14,16 +14,18 @@
 #define CPNS 3.0    /* Cycles per nanosecond -- Adjust to your computer,
                        for example a 3.2 GhZ GPU, this would be 3.2 */
 
-#define OPTIONS 3
+#define NUM_SIZES 7
+#define NUM_DENSITIES 7
 #define IDENT 0
+#define OPTIONS 2
 
 /* We want to test a wide range of matrix sizes, the sizes being
    used are defined below. */
-int *matrix_sizes = {100, 500, 1000, 5000, 10000, 50000, 100000};
+int matrix_sizes[NUM_SIZES] = {100, 500, 1000, 5000, 10000, 50000, 100000};
 
 /* We also want to test a wide range of matrix densities, the
    densities being used are defined below. */
-float *matrix_densities = {0.1, 0.05, 0.01, 0.005, 0.001, 0.0005,
+float matrix_densities[NUM_DENSITIES] = {0.1, 0.05, 0.01, 0.005, 0.001, 0.0005,
                            0.0001};
 
 typedef float data_t;
@@ -62,14 +64,19 @@ typedef struct {
 
 /* Prototypes */
 int clock_gettime(clockid_t clk_id, struct timespec *tp);
-csr_matrix_ptr new_csr_matrix(long int row_len);
+csr_matrix_ptr new_csr_matrix(long int row_len, float matrix_density);
 int set__csr_matrix_row_length(csr_matrix_ptr m, long int row_len);
 long int get_csr_matrix_row_length(csr_matrix_ptr m);
-int init_csr_matrix(csr_matrix_ptr m, long int row_len, float matrix_density);
-int f(matrix_ptr m, long int row_len);
-void mmm_ijk(matrix_ptr a, matrix_ptr b, matrix_ptr c);
-void mmm_kij(matrix_ptr a, matrix_ptr b, matrix_ptr c);
-void mmm_jki(matrix_ptr a, matrix_ptr b, matrix_ptr c);
+int init_csr_matrix(csr_matrix_ptr m);
+
+int clock_gettime(clockid_t clk_id, struct timespec *tp);
+coo_matrix_ptr new_coo_matrix(long int row_len, float density);
+int set_coo_matrix_row_length(coo_matrix_ptr m, long int row_len);
+long int get_coo_matrix_row_length(coo_matrix_ptr m);
+int init_coo_matrix(coo_matrix_ptr m);
+
+void mmm_csr(csr_matrix_ptr a, csr_matrix_ptr b, csr_matrix_ptr c);
+void mmm_coo(coo_matrix_ptr a, coo_matrix_ptr b, coo_matrix_ptr c);
 
 /* -=-=-=-=- Time measurement by clock_gettime() -=-=-=-=- */
 /*
@@ -135,14 +142,13 @@ double wakeup_delay()
 /*****************************************************************************/
 int main(int argc, char *argv[])
 {
+  int DENSITIES = sizeof(matrix_densities)/sizeof(matrix_densities[0]);
+  int SIZES = sizeof(matrix_sizes)/sizeof(matrix_sizes[0]);
   int OPTION;
   struct timespec time_start, time_stop;
-  double time_stamp[OPTIONS][NUM_TESTS];
+  double time_stamp[OPTIONS][NUM_SIZES][NUM_DENSITIES];
   double wakeup_answer;
   long int x, n, alloc_size;
-
-  x = NUM_TESTS-1;
-  alloc_size = A*x*x + B*x + C;
 
   printf("Dense MMM tests \n\n");
 
@@ -153,13 +159,6 @@ int main(int argc, char *argv[])
                                                      NUM_TESTS, C, alloc_size);
   printf("This may take a while!\n\n");
 
-  /* declare and initialize the matrix structure */
-  matrix_ptr a0 = new_matrix(alloc_size);
-  init_matrix(a0, alloc_size);
-  matrix_ptr b0 = new_matrix(alloc_size);
-  init_matrix(b0, alloc_size);
-  matrix_ptr c0 = new_matrix(alloc_size);
-  zero_matrix(c0, alloc_size);
 
   OPTION = 0;
 
@@ -254,6 +253,15 @@ coo_matrix_ptr new_coo_matrix(long int row_len, float density)
   return result;
 }
 
+/* Comparison function for qsort */
+int compare_coo(const void *a, const void *b) {
+  coo_element *ea = (coo_element *)a;
+  coo_element *eb = (coo_element *)b;
+  if (ea->row == eb->row) 
+      return ea->column - eb->column;
+  return ea->row - eb->row;
+}
+
 /* Initialize COO matrix */
 int init_coo_matrix(coo_matrix_ptr m)
 {
@@ -267,32 +275,47 @@ int init_coo_matrix(coo_matrix_ptr m)
     }
     
 
+    /* Sort elements using qsort */
+    qsort(m->elements, m->nnz, sizeof(coo_element), compare_coo);
+    
+    /* Remove duplicates */
+    long int new_nnz = 0;
+    for (long int i = 1; i < m->nnz; i++) {
+        if (m->elements[i].row != m->elements[new_nnz].row ||
+            m->elements[i].column != m->elements[new_nnz].column) {
+            new_nnz++;
+            m->elements[new_nnz] = m->elements[i];
+        }
+    }
+    m->nnz = new_nnz + 1;
+    
     return 1;
   }
   else return 0;
 }
 
-/* Zero COO matrix */
-int zero_coo_matrix(coo_matrix_ptr m)
-{
-  if (row_len > 0) {
-    m->len = row_len;
-    m->nnz = 0;
-    
-    /* Remove non-zero elements */
-    free(m->values);
-    m->values = NULL;
-    free(m->columns);
-    m->columns = NULL;
-
-    /* Clear row indices */
-    for (int i = 0; i < row_len; i++) {
-      m->row_indices[i] = IDENT;
-    }
-
-    return 1;
+/* Convert sorted COO to CSR */
+csr_matrix_ptr coo_to_csr(coo_matrix_ptr coo, csr_matrix_ptr csr) {
+  csr_matrix_ptr csr = new_csr_matrix(coo->len, coo->density);
+  if (coo->len != csr->len || coo->density != csr->density) {
+    printf("ERROR: MATRIX DENSITIES OR LENGTHS DO NOT MATCH");
+    return csr;
   }
-  else return 0;
+  
+  /* Build CSR structure */
+  int current_row = -1;
+  for (long int i = 0; i < coo->nnz; i++) {
+      while (current_row < coo->elements[i].row) {
+          current_row++;
+          csr->row_indices[current_row] = i;
+      }
+      csr->columns[i] = coo->elements[i].column;
+      csr->values[i] = coo->elements[i].value;
+  }
+  /* Finalize row pointers */
+  csr->row_indices[coo->len] = coo->nnz;
+  
+  return csr;
 }
 
 /* For getting CSR format matrix elements */
@@ -378,41 +401,12 @@ long int get_csr_matrix_row_length(csr_matrix_ptr m)
 }
 
 /* initialize csr matrix */
-int init_csr_matrix(csr_matrix_ptr m, long int row_len)
+int init_csr_matrix(csr_matrix_ptr m)
 {
-  long int i;
-
-  if (row_len > 0) {
-    m->len = row_len;
-    for (i = 0; i < row_len*row_len; i++) {
-      m->data[i] = (data_t)(i);
-    }
-    return 1;
-  }
-  else return 0;
-}
-
-/* initialize csr matrix */
-int zero_matrix(matrix_ptr m, long int row_len, )
-{
-  if (row_len > 0) {
-    m->len = row_len;
-    m->nnz = 0;
-    
-    /* Remove non-zero elements */
-    free(m->values);
-    m->values = NULL;
-    free(m->columns);
-    m->columns = NULL;
-
-    /* Clear row indices */
-    for (int i = 0; i < row_len; i++) {
-      m->row_indices[i] = IDENT;
-    }
-
-    return 1;
-  }
-  else return 0;
+  coo_matrix_ptr coo = new_coo_matrix(m->len, m->density);
+  init_coo_matrix(coo);
+  m = coo_to_csr(coo, m);
+  return 0;
 }
 
 /* For getting CSR format matrix element values */
@@ -435,63 +429,94 @@ int *get_csr_matrix_row_start(csr_matrix_ptr m)
 
 /*************************************************/
 
+int compare_int(const void *a, const void *b) {
+  int int_a = *(const int *)a;
+  int int_b = *(const int *)b;
+  if (int_a < int_b) return -1;
+  else if (int_a > int_b) return 1;
+  else return 0;
+}
+
 /* csr mmm */
 void mmm_csr(csr_matrix_ptr a, csr_matrix_ptr b, csr_matrix_ptr c)
 {
-  long int i, j, k;
-  long int length = get_matrix_row_length(a);
-  data_t *a0 = get_matrix_start(a);
-  data_t *b0 = get_matrix_start(b);
-  data_t *c0 = get_matrix_start(c);
-  data_t sum;
+  // Array for storing values of c for a given column of c
+  data_t* temp = calloc(a->len, sizeof(data_t));
 
-  for (i = 0; i < length; i++) {
-    for (j = 0; j < length; j++) {
-      sum = IDENT;
-      for (k = 0; k < length; k++) {
-        sum += a0[i*length+k] * b0[k*length+j];
+  //
+  int* temp_idx = malloc(a->len * sizeof(int));
+  
+  c->row_indices[0] = 0;
+  
+  // Loop over the rows of a
+  for (int i = 0; i < a->len; i++) {
+      int nnz = 0;
+      // Loop over a single row of a
+      for (int j = a->row_indices[i]; j < a->row_indices[i+1]; j++) {
+        // Get column and value
+        int a_col = a->columns[j];
+        data_t a_val = a->values[j];
+        
+        // Loop over the row of b that corresonds to column of a
+        for (int k = b->row_indices[a_col]; k < b->row_indices[a_col+1]; k++) {
+            
+            int b_col = b->columns[k];
+            if (temp[b_col] == 0) {
+                temp_idx[nnz++] = b_col;
+            }
+            temp[b_col] += a_val * b->values[k];
+        }
       }
-      c0[i*length+j] += sum;
-    }
+      
+      // Sort the results of the multiplication
+      qsort(temp_idx, nnz, sizeof(int), compare_int);
+      
+      for (int j = 0; j < nnz; j++) {
+          int col = temp_idx[j];
+          c->values[c->nnz] = temp[col];
+          c->columns[c->nnz] = col;
+          temp[col] = 0;
+          c->nnz++;
+      }
+      c->row_indices[i+1] = c->nnz;
   }
+  
+  free(temp);
+  free(temp_idx);
 }
 
 /* mmm */
-void mmm_kij(matrix_ptr a, matrix_ptr b, matrix_ptr c)
+void mmm_coo(coo_matrix_ptr a, coo_matrix_ptr b, coo_matrix_ptr c)
 {
-  long int i, j, k;
-  long int length = get_matrix_row_length(a);
-  data_t *a0 = get_matrix_start(a);
-  data_t *b0 = get_matrix_start(b);
-  data_t *c0 = get_matrix_start(c);
-  data_t r;
-
-  for (k = 0; k < length; k++) {
-    for (i = 0; i < length; i++) {
-      r = a0[i*length+k];
-      for (j = 0; j < length; j++) {
-        c0[i*length+j] += r*b0[k*length+j];
+  long int idx = 0;
+  for (long int i = 0; i < a->nnz; i++) {
+      int a_row = a->elements[i].row;
+      int a_col = a->elements[i].column;
+      data_t a_val = a->elements[i].value;
+      
+      for (long int j = 0; j < b->nnz; j++) {
+          if (b->elements[j].row == a_col) {
+              c->elements[idx].row = a_row;
+              c->elements[idx].column = b->elements[j].column;
+              c->elements[idx].value = a_val * b->elements[j].value;
+              idx++;
+          }
       }
-    }
   }
-}
-
-/* mmm */
-void mmm_jki(matrix_ptr a, matrix_ptr b, matrix_ptr c)
-{
-  long int i, j, k;
-  long int length = get_matrix_row_length(a);
-  data_t *a0 = get_matrix_start(a);
-  data_t *b0 = get_matrix_start(b);
-  data_t *c0 = get_matrix_start(c);
-  data_t r;
-
-  for (j = 0; j < length; j++) {
-    for (k = 0; k < length; k++) {
-      r = b0[k*length+j];
-      for (i = 0; i < length; i++) {
-        c0[i*length+j] += a0[i*length+k]*r;
+    
+  c->nnz = idx;
+  qsort(c->elements, c->nnz, sizeof(coo_element), compare_coo);
+  
+  /* Sum duplicates */
+  long int new_nnz = 0;
+  for (long int i = 1; i < c->nnz; i++) {
+      if (c->elements[i].row == c->elements[new_nnz].row &&
+          c->elements[i].column == c->elements[new_nnz].column) {
+          c->elements[new_nnz].value += c->elements[i].value;
+      } else {
+          new_nnz++;
+          c->elements[new_nnz] = c->elements[i];
       }
-    }
   }
+  c->nnz = new_nnz + 1;
 }
