@@ -17,7 +17,7 @@
 #define NUM_SIZES 12
 #define NUM_DENSITIES 7
 #define IDENT 0
-#define OPTIONS 2
+#define OPTIONS 3
 
 /* We want to test a wide range of matrix sizes, the sizes being
    used are defined below. */
@@ -78,6 +78,9 @@ int init_coo_matrix(coo_matrix_ptr m);
 
 void mmm_csr(csr_matrix_ptr a, csr_matrix_ptr b, csr_matrix_ptr c);
 void mmm_coo(coo_matrix_ptr a, coo_matrix_ptr b, coo_matrix_ptr c);
+void mmm_csr_optimized(csr_matrix_ptr a, csr_matrix_ptr b, csr_matrix_ptr c);
+csr_matrix_ptr transpose_csr(csr_matrix_ptr mat);
+void free_csr_matrix(csr_matrix_ptr mat);
 
 /* -=-=-=-=- Time measurement by clock_gettime() -=-=-=-=- */
 /*
@@ -185,6 +188,34 @@ int main(int argc, char *argv[])
   
   OPTION++;
   for (i=0; i<NUM_SIZES; i++) {
+    matrix_size = matrix_sizes[i];
+    for (j=0; j<NUM_DENSITIES; j++) {
+      printf(" OPT %d, iter %ld, size %ld, density %f\n", OPTION, j + NUM_SIZES * i, matrix_size,
+             matrix_densities[j]);
+      if (matrix_size * matrix_size * matrix_densities[j] <= 2500000) {
+	      csr_matrix_ptr a0 = new_csr_matrix(matrix_size, matrix_densities[j]);
+	      csr_matrix_ptr b0 = new_csr_matrix(matrix_size, matrix_densities[j]);
+	      csr_matrix_ptr c0 = new_csr_matrix(matrix_size, matrix_densities[j]);
+	      init_csr_matrix(a0);
+	      init_csr_matrix(b0);
+	      init_csr_matrix(c0);
+	      set_csr_matrix_row_length(a0, matrix_size);
+	      set_csr_matrix_row_length(b0, matrix_size);
+	      set_csr_matrix_row_length(c0, matrix_size);
+	      clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_start);
+              mmm_csr_optimized(a0, b0, c0);
+              clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_stop);
+              time_stamp[OPTION][i][j] = interval(time_start, time_stop);
+      }
+      else {
+              time_stamp[OPTION][i][j] = 0;
+      }
+    }
+  }
+  
+  /*
+  OPTION++;
+  for (i=0; i<NUM_SIZES; i++) {
     for (j=0; j<NUM_DENSITIES; j++) {
       matrix_size = matrix_sizes[i];
       printf(" OPT %d, iter %ld, size %ld, density %f\n", OPTION, j + NUM_SIZES * i, matrix_size,
@@ -203,7 +234,7 @@ int main(int argc, char *argv[])
       clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time_stop);
       time_stamp[OPTION][i][j] = interval(time_start, time_stop);
     }
-  }
+  } */
   
   printf("Done collecting measurements.\n\n");
 
@@ -484,7 +515,7 @@ int compare_int(const void *a, const void *b) {
 void mmm_csr(csr_matrix_ptr a, csr_matrix_ptr b, csr_matrix_ptr c)
 {
   // Initialize dynamic storage for output matrix
-    size_t capacity = 1024;  // Initial capacity
+    size_t capacity = a->len;  // Initial capacity
     c->values = realloc(c->values, capacity * sizeof(data_t));
     c->columns = realloc(c->columns, capacity * sizeof(int));
     c->nnz = 0;
@@ -538,6 +569,108 @@ void mmm_csr(csr_matrix_ptr a, csr_matrix_ptr b, csr_matrix_ptr c)
 
     free(temp);
     free(temp_idx);
+}
+
+void mmm_csr_optimized(csr_matrix_ptr a, csr_matrix_ptr b, csr_matrix_ptr c) {
+  // First transpose matrix b for better access patterns
+  csr_matrix_ptr b_transposed = transpose_csr(b);
+  if (!b_transposed) {
+      printf("Failed to transpose matrix B\n");
+      return;
+  }
+
+  // Initialize result matrix
+  c->nnz = 0;
+  c->row_indices[0] = 0;
+
+  // Temporary arrays for accumulation
+  data_t* temp_values = calloc(a->len, sizeof(data_t));
+  int* temp_cols = malloc(a->len * sizeof(int));
+
+  for (long int i = 0; i < a->len; i++) {
+      int nnz = 0;
+
+      // Multiply row i of A with columns of B (rows of B_transposed)
+      for (long int j = a->row_indices[i]; j < a->row_indices[i+1]; j++) {
+          long int a_col = a->columns[j];
+          data_t a_val = a->values[j];
+
+          // Access corresponding row in transposed B
+          for (long int k = b_transposed->row_indices[a_col]; 
+               k < b_transposed->row_indices[a_col+1]; k++) {
+              long int b_col = b_transposed->columns[k];
+              
+              if (temp_values[b_col] == 0) {
+                  temp_cols[nnz++] = b_col;
+              }
+              temp_values[b_col] += a_val * b_transposed->values[k];
+          }
+      }
+
+      // Sort the resulting columns
+      qsort(temp_cols, nnz, sizeof(int), compare_int);
+
+      // Store results in output matrix
+      for (int j = 0; j < nnz; j++) {
+          long int col = temp_cols[j];
+          c->values[c->nnz] = temp_values[col];
+          c->columns[c->nnz] = col;
+          temp_values[col] = 0;  // Reset for next row
+          c->nnz++;
+      }
+      c->row_indices[i+1] = c->nnz;
+  }
+
+  free(temp_values);
+  free(temp_cols);
+  free_csr_matrix(b_transposed);  // Need to implement this
+}
+
+csr_matrix_ptr transpose_csr(csr_matrix_ptr mat) {
+  // Allocate new matrix for transpose
+  csr_matrix_ptr transposed = new_csr_matrix(mat->len, mat->density);
+  if (!transposed) return NULL;
+
+  // Count non-zeros per column (which becomes row in transpose)
+  int *col_counts = calloc(mat->len, sizeof(int));
+  for (long int i = 0; i < mat->nnz; i++) {
+      col_counts[mat->columns[i]]++;
+  }
+
+  // Compute new row pointers (cumulative sum of counts)
+  transposed->row_indices[0] = 0;
+  for (long int i = 1; i <= mat->len; i++) {
+      transposed->row_indices[i] = transposed->row_indices[i-1] + col_counts[i-1];
+  }
+
+  // Temporary array to track current position in each new row
+  int *row_pos = calloc(mat->len, sizeof(int));
+
+  // Fill values and columns
+  for (long int i = 0; i < mat->len; i++) {
+      for (long int j = mat->row_indices[i]; j < mat->row_indices[i+1]; j++) {
+          long int col = mat->columns[j];
+          long int pos = transposed->row_indices[col] + row_pos[col];
+          
+          transposed->values[pos] = mat->values[j];
+          transposed->columns[pos] = i;
+          row_pos[col]++;
+      }
+  }
+
+  transposed->nnz = mat->nnz;
+  free(col_counts);
+  free(row_pos);
+  return transposed;
+}
+
+void free_csr_matrix(csr_matrix_ptr mat) {
+  if (mat) {
+      free(mat->values);
+      free(mat->columns);
+      free(mat->row_indices);
+      free(mat);
+  }
 }
 
 /* mmm */
